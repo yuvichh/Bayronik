@@ -958,7 +958,7 @@ impl BayronikApp {
 
         ui.add_space(12.0);
         ui.separator();
-        ui.small("MIT License • github.com/Yuvraj-cyborg/Bayronik");
+        ui.small("MIT License • github.com/yuvichh/Bayronik");
     }
 
     // ---- Shared analysis plots ----
