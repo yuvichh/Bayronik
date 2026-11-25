@@ -63,6 +63,7 @@ from .ufno import (
     UFNO2d,
     UFNO2dConditional,
     AttentionUFNO2d,
+    PeriodicUFNO2d,
     UFNOEncoderBlock,
     UFNODecoderBlock,
 )
@@ -75,6 +76,7 @@ from .losses import (
     GradientLoss,
     MultiscaleLoss,
     MassConservationLoss,
+    NbodyHydroLoss,
     create_loss,
 )
 
@@ -83,7 +85,9 @@ from .dataset import (
     CAMELSDataset,
     MultiSuiteDataset,
     MultiRedshiftDataset,
+    NbodyHydroMaps,
     create_dataloaders,
+    sim_split,
 )
 
 # Export utilities
@@ -110,6 +114,7 @@ MODELS = {
     "ufno": UFNO2d,
     "ufno_cond": UFNO2dConditional,
     "ufno_attention": AttentionUFNO2d,
+    "ufno_v2": PeriodicUFNO2d,
 }
 
 
@@ -149,6 +154,7 @@ __all__ = [
     "UFNO2d",
     "UFNO2dConditional",
     "AttentionUFNO2d",
+    "PeriodicUFNO2d",
     "UFNOEncoderBlock",
     "UFNODecoderBlock",
     # Losses
@@ -158,12 +164,15 @@ __all__ = [
     "GradientLoss",
     "MultiscaleLoss",
     "MassConservationLoss",
+    "NbodyHydroLoss",
     "create_loss",
     # Dataset
     "CAMELSDataset",
     "MultiSuiteDataset",
     "MultiRedshiftDataset",
     "create_dataloaders",
+    "NbodyHydroMaps",
+    "sim_split",
     # Export
     "export_torchscript",
     "export_onnx",

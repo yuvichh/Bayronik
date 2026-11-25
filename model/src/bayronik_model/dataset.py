@@ -148,9 +148,10 @@ class CAMELSDataset(Dataset):
 
     def _compute_stats(self) -> Dict[str, float]:
         """Compute dataset statistics for normalization."""
-        # Sample a subset for efficiency
+        # Sample a subset for efficiency (seeded so stats are reproducible)
         n_sample = min(100, self.num_samples)
-        indices = np.random.choice(self.num_samples, n_sample, replace=False)
+        rng = np.random.default_rng(0)
+        indices = rng.choice(self.num_samples, n_sample, replace=False)
         
         input_sample = np.stack([self.input_maps[i] for i in indices])
         target_sample = np.stack([self.target_maps[i] for i in indices])
@@ -369,35 +370,241 @@ class MultiRedshiftDataset(Dataset):
         return result
 
 
+def infer_sim_layout(
+    num_maps: int,
+    data_dir: Path,
+    suite: str,
+    dataset_type: str,
+) -> Tuple[int, int]:
+    """Return ``(n_sims, maps_per_sim)`` for a CAMELS map file.
+
+    LH: the params file has one row per simulation and CAMELS Multifield
+    ships ``num_maps = 15 * n_sims`` (15 projections per box).
+    CV: no per-sim params file, but the 15-projections-per-box layout is
+    the same.
+    """
+    for name in (
+        f"params_{dataset_type}_{suite}.txt",
+        f"params_{suite}_{dataset_type}.txt",
+    ):
+        param_file = data_dir / name
+        if param_file.exists():
+            n_sims = np.loadtxt(param_file).shape[0]
+            if n_sims > 0 and num_maps % n_sims == 0:
+                return n_sims, num_maps // n_sims
+    if num_maps % 15 == 0:
+        return num_maps // 15, 15
+    return num_maps, 1
+
+
+def sim_split(
+    n_sims: int,
+    val_split: float = 0.10,
+    test_split: float = 0.10,
+    seed: int = 42,
+) -> Dict[str, np.ndarray]:
+    """Disjoint train/val/test simulation indices, reproducible from the seed."""
+    order = np.random.default_rng(seed).permutation(n_sims)
+    n_test = int(round(n_sims * test_split))
+    n_val = max(1, int(round(n_sims * val_split)))
+    return {
+        "test": np.sort(order[:n_test]),
+        "val": np.sort(order[n_test : n_test + n_val]),
+        "train": np.sort(order[n_test + n_val :]),
+    }
+
+
+class NbodyHydroMaps:
+    """Paired N-body -> hydro total-matter maps, held in memory in network units.
+
+    The input is the total-matter map of the gravity-only twin of each CAMELS
+    box (same initial conditions as the hydro run); the target is the hydro
+    total-matter map. Both are stored as u = (log10 Sigma - 11) / 0.5, see
+    ``fields.py``. Parameters are stored mapped to [-1, 1].
+
+    The whole selection lives on ``device``, so batching and augmentation cost
+    no data-loader time: 12,000 map pairs take 6.3 GB.
+
+    Args:
+        data_dir: Directory with the CMD .npy files and the params file
+        suite: Hydro suite of the target maps
+        dataset_type: LH or CV
+        input_field: "Mtot_Nbody" (gravity-only run) or "Mcdm" (dark matter of
+            the hydro run; only for comparison with the old task)
+        sims: Simulation indices to load; None loads all
+        device: Where the tensors live
+    """
+
+    MAPS_PER_SIM = 15
+
+    def __init__(
+        self,
+        data_dir: str,
+        suite: str = "IllustrisTNG",
+        dataset_type: str = "LH",
+        input_field: str = "Mtot_Nbody",
+        redshift: str = "0.00",
+        sims: Optional[np.ndarray] = None,
+        device: Union[str, torch.device] = "cpu",
+    ):
+        from .fields import FIDUCIAL_PARAMS, INPUT_FIELD_UNITS, encode_field, encode_params
+
+        if input_field not in INPUT_FIELD_UNITS:
+            raise ValueError(f"input_field must be one of {list(INPUT_FIELD_UNITS)}, got {input_field!r}")
+
+        data_dir = Path(data_dir)
+        input_path = data_dir / f"Maps_{input_field}_{suite}_{dataset_type}_z={redshift}.npy"
+        target_path = data_dir / f"Maps_Mtot_{suite}_{dataset_type}_z={redshift}.npy"
+        for path in (input_path, target_path):
+            if not path.exists():
+                raise FileNotFoundError(f"Map file not found: {path}")
+
+        inputs = np.load(input_path, mmap_mode="r")
+        targets = np.load(target_path, mmap_mode="r")
+        if inputs.shape != targets.shape:
+            raise ValueError(f"Input/target shape mismatch: {inputs.shape} vs {targets.shape}")
+
+        self.n_sims_total = inputs.shape[0] // self.MAPS_PER_SIM
+        if inputs.shape[0] != self.n_sims_total * self.MAPS_PER_SIM:
+            raise ValueError(f"{inputs.shape[0]} maps is not a multiple of {self.MAPS_PER_SIM} per simulation")
+        self.sims = np.arange(self.n_sims_total) if sims is None else np.sort(np.asarray(sims))
+        self.map_index = (
+            self.sims[:, None] * self.MAPS_PER_SIM + np.arange(self.MAPS_PER_SIM)[None, :]
+        ).reshape(-1)
+
+        unit = INPUT_FIELD_UNITS[input_field]
+        n = len(self.map_index)
+        x = torch.empty(n, 1, *inputs.shape[1:], dtype=torch.float32)
+        y = torch.empty_like(x)
+        # One simulation at a time keeps peak host memory at the size of the
+        # selection, even when the files are far larger than RAM.
+        for j, sim in enumerate(self.sims):
+            src = slice(sim * self.MAPS_PER_SIM, (sim + 1) * self.MAPS_PER_SIM)
+            dst = slice(j * self.MAPS_PER_SIM, (j + 1) * self.MAPS_PER_SIM)
+            x[dst, 0] = torch.from_numpy(encode_field(np.asarray(inputs[src], dtype=np.float64) * unit))
+            y[dst, 0] = torch.from_numpy(encode_field(np.asarray(targets[src], dtype=np.float64)))
+
+        params = self._load_params(data_dir, suite, dataset_type, FIDUCIAL_PARAMS)
+        params = encode_params(params[self.sims].astype(np.float64)).astype(np.float32)
+
+        self.input_field = input_field
+        self.device = torch.device(device)
+        self.x = x.to(self.device)
+        self.y = y.to(self.device)
+        self.params = torch.from_numpy(np.repeat(params, self.MAPS_PER_SIM, axis=0)).to(self.device)
+
+    def _load_params(self, data_dir: Path, suite: str, dataset_type: str, fiducial) -> np.ndarray:
+        for name in (
+            f"params_{dataset_type}_{suite}.txt",
+            f"params_{dataset_type}_Nbody_{suite}.txt",
+        ):
+            if (data_dir / name).exists():
+                params = np.atleast_2d(np.loadtxt(data_dir / name))[:, :6]
+                if params.shape[0] != self.n_sims_total:
+                    raise ValueError(
+                        f"{name} has {params.shape[0]} rows for {self.n_sims_total} simulations"
+                    )
+                return params
+        if dataset_type == "CV":
+            return np.tile(np.asarray(fiducial), (self.n_sims_total, 1))
+        raise FileNotFoundError(f"No parameter file for {dataset_type} {suite} in {data_dir}")
+
+    def __len__(self) -> int:
+        return self.x.shape[0]
+
+    @staticmethod
+    def augment(x: torch.Tensor, y: torch.Tensor, generator: torch.Generator):
+        """Random symmetries of a periodic map, applied to the pair together.
+
+        Flips, the transpose and periodic shifts are exact symmetries of the
+        problem, so they add no bias.
+        """
+        b, n = x.shape[0], x.shape[-1]
+        pair = torch.cat([x, y], dim=1)
+        draw = torch.rand(3, b, generator=generator)
+        for axis, row in ((-1, 0), (-2, 1)):
+            sel = (draw[row] < 0.5).to(pair.device)
+            pair[sel] = pair[sel].flip(axis)
+        sel = (draw[2] < 0.5).to(pair.device)
+        pair[sel] = pair[sel].transpose(-2, -1)
+        shifts = torch.randint(0, n, (b, 2), generator=generator)
+        pair = torch.stack(
+            [torch.roll(pair[i], (int(sx), int(sy)), dims=(-2, -1)) for i, (sx, sy) in enumerate(shifts)]
+        )
+        return pair[:, :1], pair[:, 1:]
+
+    def batches(
+        self,
+        batch_size: int,
+        shuffle: bool = False,
+        augment: bool = False,
+        generator: Optional[torch.Generator] = None,
+        drop_last: bool = False,
+    ):
+        """Yield (input, target, params) batches on ``self.device``."""
+        n = len(self)
+        if generator is None:
+            generator = torch.Generator().manual_seed(0)
+        order = torch.randperm(n, generator=generator) if shuffle else torch.arange(n)
+        stop = n - (n % batch_size) if drop_last else n
+        for start in range(0, stop, batch_size):
+            idx = order[start : start + batch_size].to(self.device)
+            x, y, p = self.x[idx], self.y[idx], self.params[idx]
+            if augment:
+                x, y = self.augment(x, y, generator)
+            yield x, y, p
+
+    def num_batches(self, batch_size: int, drop_last: bool = False) -> int:
+        n = len(self)
+        return n // batch_size if drop_last else -(-n // batch_size)
+
+
 def create_dataloaders(
     data_dir: str,
     batch_size: int = 8,
     num_workers: int = 4,
     suite: str = "IllustrisTNG",
     dataset_type: str = "LH",
-    val_split: float = 0.15,
+    val_split: float = 0.10,
+    test_split: float = 0.10,
+    split_by_sim: bool = True,
+    split_seed: int = 42,
+    split_file: Optional[str] = None,
     augment_train: bool = True,
     return_params: bool = False,
     **kwargs,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
     Create train and validation dataloaders.
-    
+
+    By default the split is done at the SIMULATION level: all projections of
+    a given CAMELS box land on the same side of the split. A map-level random
+    split leaks train information into validation because the 15 projections
+    of one box share the same large-scale structure.
+
     Args:
         data_dir: Data directory
         batch_size: Batch size
         num_workers: Number of data loading workers
         suite: Simulation suite
         dataset_type: CV or LH
-        val_split: Validation split ratio
+        val_split: Fraction of simulations held out for validation
+        test_split: Fraction of simulations held out for the final test set.
+            Test maps are never loaded here; the sim indices are recorded in
+            ``split_file`` for the offline validation script.
+        split_by_sim: Split at simulation granularity (default). Set False
+            to reproduce the legacy leaky map-level split.
+        split_seed: RNG seed for the sim permutation
+        split_file: Optional JSON path where the train/val/test sim indices
+            are persisted for downstream evaluation.
         augment_train: Enable augmentation for training
         return_params: Return physics parameters
-    
+
     Returns:
         train_loader, val_loader
     """
-    from torch.utils.data import DataLoader, random_split
-    
+    from torch.utils.data import DataLoader, Subset, random_split
+
     # Create dataset
     dataset = CAMELSDataset(
         data_dir=data_dir,
@@ -407,16 +614,56 @@ def create_dataloaders(
         return_params=return_params,
         **kwargs,
     )
-    
-    # Split
-    val_size = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
-    
+
+    n_maps = len(dataset)
+
+    if split_by_sim:
+        n_sims, maps_per_sim = infer_sim_layout(
+            n_maps, Path(data_dir), suite, dataset_type
+        )
+        split = sim_split(n_sims, val_split, test_split, split_seed)
+        train_sims, val_sims, test_sims = split["train"], split["val"], split["test"]
+
+        def expand(sims: np.ndarray) -> List[int]:
+            return [
+                int(s) * maps_per_sim + j for s in sims for j in range(maps_per_sim)
+            ]
+
+        train_ds = Subset(dataset, expand(train_sims))
+        val_ds = Subset(dataset, expand(val_sims))
+
+        print(
+            f"Sim-level split (seed {split_seed}): "
+            f"{len(train_sims)} train / {len(val_sims)} val / {len(test_sims)} test sims "
+            f"({maps_per_sim} maps/sim; test maps excluded from training)"
+        )
+
+        if split_file is not None:
+            payload = {
+                "seed": split_seed,
+                "suite": suite,
+                "dataset_type": dataset_type,
+                "n_sims": int(n_sims),
+                "maps_per_sim": int(maps_per_sim),
+                "train_sims": [int(s) for s in train_sims],
+                "val_sims": [int(s) for s in val_sims],
+                "test_sims": [int(s) for s in test_sims],
+            }
+            split_path = Path(split_file)
+            split_path.parent.mkdir(parents=True, exist_ok=True)
+            split_path.write_text(json.dumps(payload, indent=2))
+            print(f"Split indices written to {split_path}")
+    else:
+        # Legacy map-level split. Projections of the same simulation land in
+        # both train and val, so val metrics overstate generalization.
+        val_size = int(n_maps * val_split)
+        train_size = n_maps - val_size
+        train_ds, val_ds = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(split_seed),
+        )
+
     # Create augmented wrapper for training
     if augment_train:
         train_ds = AugmentedDataset(train_ds)

@@ -57,8 +57,10 @@ class SpectralConv2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.shape[0]
         
-        # FFT
-        x_ft = torch.fft.rfft2(x)
+        # FFT. Always in float32: half and bfloat16 FFTs are not available on
+        # every backend, so under autocast the layer casts in and back out.
+        dtype = x.dtype
+        x_ft = torch.fft.rfft2(x.float())
         
         # Prepare output tensor
         out_ft = torch.zeros(
@@ -77,7 +79,7 @@ class SpectralConv2d(nn.Module):
         )
         
         # Inverse FFT
-        return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1))).to(dtype)
 
 
 class FNOBlock2d(nn.Module):

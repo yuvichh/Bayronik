@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS = ROOT / "weights" / "best_ufno_cond_LH_IllustrisTNG.pth"
 DATA = ROOT / "data"
 REPORTS = ROOT / "reports"
+SPLIT_FILE = ROOT / "weights" / "split_LH_IllustrisTNG.json"
 
 # CV simulations of IllustrisTNG share the fiducial cosmology of CAMELS.
 # Numbers from camels_documentation: Omega_m=0.3, sigma_8=0.8, A_SN1=A_AGN1=A_SN2=A_AGN2=1.0
@@ -65,6 +66,7 @@ class SampleMetrics:
 class SplitSummary:
     split: str
     samples: int
+    eval_scope: str
     mean_infer_ms: float
     mean_log_mse: float
     mean_baseline_log_mse: float
@@ -80,6 +82,7 @@ class SplitSummary:
     per_sample: List[dict] = field(default_factory=list)
     pk_log_mae_by_bin: list = field(default_factory=list)
     pk_relative_err_by_bin: list = field(default_factory=list)
+    pk_bin_mode_counts: list = field(default_factory=list)
 
 
 def load_model(device: torch.device) -> UFNO2dConditional:
@@ -218,6 +221,7 @@ def run_split(
     bins: int,
     model: UFNO2dConditional,
     device: torch.device,
+    eval_scope: str = "full_dataset",
 ) -> SplitSummary:
     dm = np.load(dm_path, mmap_mode="r")
     mtot = np.load(mtot_path, mmap_mode="r")
@@ -225,6 +229,7 @@ def run_split(
     samples: list[SampleMetrics] = []
     pk_log_mae_bins: list[np.ndarray] = []
     pk_rel_err_bins: list[np.ndarray] = []
+    resolution = int(dm.shape[-1])
 
     for idx in indices:
         dm_field = np.asarray(dm[idx], dtype=np.float32)
@@ -283,9 +288,18 @@ def run_split(
     pk_log_mae_by_bin = np.nan_to_num(pk_log_mae_by_bin, nan=0.0).tolist()
     pk_relative_err_by_bin = np.nan_to_num(pk_relative_err_by_bin, nan=0.0).tolist()
 
+    # Geometric k-bins on a discrete lattice can be empty (no modes fall in
+    # the bin). Record mode counts so empty bins are distinguishable from
+    # genuinely-zero error in the report.
+    kr, edges, _ = _radial_bins(resolution, bins)
+    pk_bin_mode_counts = [
+        int(((kr >= lo) & (kr < hi)).sum()) for lo, hi in zip(edges[:-1], edges[1:])
+    ]
+
     summary = SplitSummary(
         split=split,
         samples=len(samples),
+        eval_scope=eval_scope,
         mean_infer_ms=float(np.mean([s.infer_ms for s in samples])),
         mean_log_mse=float(np.mean([s.log_mse for s in samples])),
         mean_baseline_log_mse=float(np.mean([s.baseline_log_mse for s in samples])),
@@ -309,6 +323,7 @@ def run_split(
         per_sample=[asdict(s) for s in samples],
         pk_log_mae_by_bin=pk_log_mae_by_bin,
         pk_relative_err_by_bin=pk_relative_err_by_bin,
+        pk_bin_mode_counts=pk_bin_mode_counts,
     )
     return summary
 
@@ -385,12 +400,12 @@ def write_markdown(path: Path, summaries: list[SplitSummary], sensitivity: list[
     lines += [
         "## Aggregate metrics",
         "",
-        "| split | n | infer ms | log MSE | baseline | × | log MAE | P(k) MAE | base | × | r(k) | suppression err |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| split | eval scope | n | infer ms | log MSE | baseline | × | log MAE | P(k) MAE | base | × | r(k) | suppression err |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for s in summaries:
         lines.append(
-            f"| {s.split} | {s.samples} | {s.mean_infer_ms:.1f} | "
+            f"| {s.split} | {s.eval_scope} | {s.samples} | {s.mean_infer_ms:.1f} | "
             f"{s.mean_log_mse:.4f} | {s.mean_baseline_log_mse:.4f} | "
             f"{s.mse_improvement_x:.2f} | {s.mean_log_mae:.4f} | "
             f"{s.mean_pk_log_mae:.4f} | {s.mean_baseline_pk_log_mae:.4f} | "
@@ -400,11 +415,19 @@ def write_markdown(path: Path, summaries: list[SplitSummary], sensitivity: list[
 
     for s in summaries:
         lines += ["", f"### Per-bin P(k) MAE — {s.split}", ""]
-        lines += ["| bin | log MAE | rel. err |", "| ---: | ---: | ---: |"]
-        for i, (mae, rel) in enumerate(
-            zip(s.pk_log_mae_by_bin, s.pk_relative_err_by_bin)
+        lines += [
+            "| bin | modes | log MAE | rel. err |",
+            "| ---: | ---: | ---: | ---: |",
+        ]
+        counts = s.pk_bin_mode_counts or [None] * len(s.pk_log_mae_by_bin)
+        for i, (mae, rel, cnt) in enumerate(
+            zip(s.pk_log_mae_by_bin, s.pk_relative_err_by_bin, counts)
         ):
-            lines.append(f"| {i} | {mae:.4f} | {rel:.4f} |")
+            if cnt == 0:
+                lines.append(f"| {i} | 0 | - | - |")
+            else:
+                cnt_str = str(cnt) if cnt is not None else "?"
+                lines.append(f"| {i} | {cnt_str} | {mae:.4f} | {rel:.4f} |")
 
     lines += ["", "## Parameter sensitivity (single sample)", ""]
     lines += ["| parameter | values | norm response | monotonic |", "| --- | --- | ---: | :---: |"]
@@ -429,12 +452,47 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def load_test_map_indices(split_file: Path, n_maps: int) -> tuple[list, dict]:
+    """Map indices of the held-out test simulations, or None if no split file.
+
+    The split file is written by ``create_dataloaders`` during training and
+    lists which simulation indices were excluded from both train and val.
+    Without it, LH metrics are computed over the full dataset — which
+    includes maps the model was trained on and therefore overstates accuracy.
+    """
+    if not split_file.exists():
+        return None, {
+            "scope": "full_dataset",
+            "warning": "no split file found; LH metrics include training maps",
+        }
+    payload = json.loads(split_file.read_text())
+    mps = int(payload["maps_per_sim"])
+    test_sims = payload["test_sims"]
+    idx = [
+        s * mps + j for s in test_sims for j in range(mps) if s * mps + j < n_maps
+    ]
+    meta = {
+        "scope": "held_out_test_sims",
+        "n_test_sims": len(test_sims),
+        "maps_per_sim": mps,
+        "split_seed": payload.get("seed"),
+        "split_file": str(split_file),
+    }
+    return idx, meta
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lh-samples", type=int, default=32)
     parser.add_argument("--cv-samples", type=int, default=16)
     parser.add_argument("--bins", type=int, default=24)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--split-file",
+        default=str(SPLIT_FILE),
+        help="JSON with held-out test sims written during training. "
+        "If present, LH metrics are computed on test sims only.",
+    )
     parser.add_argument(
         "--report-dir",
         default=str(REPORTS),
@@ -476,7 +534,25 @@ def main() -> None:
     def cond_cv(_idx: int) -> np.ndarray:
         return FIDUCIAL_COND.copy()
 
-    lh_indices = np.linspace(0, n_maps - 1, args.lh_samples, dtype=int).tolist()
+    test_indices, lh_eval = load_test_map_indices(Path(args.split_file), n_maps)
+    if test_indices is None:
+        print(
+            "WARNING: no split file at "
+            f"{args.split_file}; LH metrics will include maps the model was "
+            "trained on. Retrain with the sim-level split to fix this."
+        )
+        lh_indices = np.linspace(0, n_maps - 1, args.lh_samples, dtype=int).tolist()
+    else:
+        n_take = min(args.lh_samples, len(test_indices))
+        sel = np.linspace(0, len(test_indices) - 1, n_take, dtype=int)
+        lh_indices = [test_indices[i] for i in sel]
+        print(
+            f"LH evaluation restricted to {lh_eval['n_test_sims']} held-out "
+            f"test sims ({len(test_indices)} maps, sampling {n_take})"
+        )
+
+    # CV boxes were never part of LH training: always a clean hold-out,
+    # but only at the fiducial cosmology.
     dm_cv = np.load(DATA / "Maps_Mcdm_IllustrisTNG_CV_z=0.00.npy", mmap_mode="r")
     cv_indices = np.linspace(0, dm_cv.shape[0] - 1, args.cv_samples, dtype=int).tolist()
 
@@ -491,6 +567,7 @@ def main() -> None:
             args.bins,
             model,
             device,
+            eval_scope=lh_eval["scope"],
         )
     )
     summaries.append(
@@ -503,6 +580,7 @@ def main() -> None:
             args.bins,
             model,
             device,
+            eval_scope="held_out_suite_fiducial",
         )
     )
 
@@ -528,6 +606,7 @@ def main() -> None:
         "weights_sha256": weights_sha,
         "env": env,
         "args": vars(args),
+        "lh_eval": lh_eval,
         "splits": [
             {
                 **{k: v for k, v in asdict(s).items() if k not in {"per_sample"}},
