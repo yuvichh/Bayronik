@@ -2,7 +2,7 @@
 # Rust runtime (engine, infer, registry, server, client) + Python (training,
 # scientific validation). One Makefile, prod targets only.
 
-.PHONY: help setup build test train validate phase2 server client wasm clean
+.PHONY: help setup build test train validate benchmark bundle phase2 server client wasm clean
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -17,6 +17,7 @@ TCH_ENV       = $(ACTIVATE) && $(LIBTORCH_ENV) && export DYLD_LIBRARY_PATH=$(PYT
 DATA_DIR     := model/data
 WEIGHTS_DIR  := model/weights
 CAMELS_BASE  := https://users.flatironinstitute.org/~fvillaescusa/priv/DEPnzxoWlaTQ6CjrXqsm0vYi8L7Jy/CMD/2D_maps/data/IllustrisTNG
+CAMELS_NBODY := https://users.flatironinstitute.org/~fvillaescusa/priv/DEPnzxoWlaTQ6CjrXqsm0vYi8L7Jy/CMD/2D_maps/data/Nbody/L25n256
 
 SERVER_BIN   := target/release/server
 INFER_BIN    := target/release/infer
@@ -39,10 +40,12 @@ help:
 	@echo "  wasm         Build WASM client (-> client/pkg/) and serve on :8080"
 	@echo "  infer        Terminal inference UI (infer crate)"
 	@echo ""
-	@echo "  download-lh  Download CAMELS IllustrisTNG LH maps + params"
-	@echo "  download-cv  Download CAMELS CV split"
-	@echo "  train        Train conditional U-FNO on LH"
-	@echo "  validate     Scientific validation (LH + CV) -> reports/"
+	@echo "  download-lh  Download CAMELS LH maps (N-body input, hydro target) + params"
+	@echo "  download-cv  Download CAMELS CV maps (N-body input, hydro target)"
+	@echo "  train        Train the periodic U-FNO: N-body -> hydro total matter"
+	@echo "  benchmark    Held-out test sims + CV against baselines -> reports/ (WEIGHTS=... optional)"
+	@echo "  bundle       Pack the training code for a rented GPU -> model/bayronik_bundle.tar.gz"
+	@echo "  validate     Legacy validation of the old hydro-CDM model -> reports/"
 	@echo "  phase2       validate -> rebuild registry -> regression tests"
 	@echo ""
 	@echo "  clean        Remove build artifacts"
@@ -120,11 +123,12 @@ test-model-slow: setup
 
 download-lh:
 	@mkdir -p $(DATA_DIR)
-	@for f in Maps_Mcdm_IllustrisTNG_LH_z=0.00.npy Maps_Mtot_IllustrisTNG_LH_z=0.00.npy; do \
-		if [ ! -f "$(DATA_DIR)/$$f" ]; then \
-			wget -c -P $(DATA_DIR) "$(CAMELS_BASE)/$$f"; \
-		fi; \
-	done
+	@if [ ! -f "$(DATA_DIR)/Maps_Mtot_IllustrisTNG_LH_z=0.00.npy" ]; then \
+		wget -c -P $(DATA_DIR) "$(CAMELS_BASE)/Maps_Mtot_IllustrisTNG_LH_z=0.00.npy"; \
+	fi
+	@if [ ! -f "$(DATA_DIR)/Maps_Mtot_Nbody_IllustrisTNG_LH_z=0.00.npy" ]; then \
+		wget -c -P $(DATA_DIR) "$(CAMELS_NBODY)/Maps_Mtot_Nbody_IllustrisTNG_LH_z=0.00.npy"; \
+	fi
 	@if [ ! -f "$(DATA_DIR)/params_LH_IllustrisTNG.txt" ]; then \
 		wget -O $(DATA_DIR)/_raw_params.txt \
 			"https://raw.githubusercontent.com/franciscovillaescusa/CAMELS/master/docs/params/IllustrisTNG/CosmoAstroSeed_IllustrisTNG_L25n256_LH.txt" && \
@@ -134,16 +138,29 @@ download-lh:
 
 download-cv:
 	@mkdir -p $(DATA_DIR)
-	@cd model && uv run python download_data.py --dataset CV
+	@if [ ! -f "$(DATA_DIR)/Maps_Mtot_IllustrisTNG_CV_z=0.00.npy" ]; then \
+		wget -c -P $(DATA_DIR) "$(CAMELS_BASE)/Maps_Mtot_IllustrisTNG_CV_z=0.00.npy"; \
+	fi
+	@if [ ! -f "$(DATA_DIR)/Maps_Mtot_Nbody_IllustrisTNG_CV_z=0.00.npy" ]; then \
+		wget -c -P $(DATA_DIR) "$(CAMELS_NBODY)/Maps_Mtot_Nbody_IllustrisTNG_CV_z=0.00.npy"; \
+	fi
 
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
 
 train: setup
-	@cd model && uv run python train.py --model ufno_cond --conditional --dataset LH \
-		--epochs 100 --batch-size 16 --patience 20 --no-amp \
-		--spectral-weight 0.5 --mass-weight 0.01 --verbose
+	@cd model && uv run python train.py --model ufno_v2 --dataset LH --epochs 40 --batch-size 16 --verbose
+
+# Held-out LH test sims and CV against the identity and amplitude baselines.
+# make benchmark WEIGHTS=model/weights/<run>/best.pt adds the trained model.
+benchmark: setup
+	@cd model && uv run --with matplotlib python benchmarks/nbody2hydro.py \
+		$${WEIGHTS:+--weights $(abspath $(WEIGHTS))}
+
+bundle:
+	@cd model && tar -czf bayronik_bundle.tar.gz train.py pyproject.toml src/bayronik_model/*.py \
+		benchmarks/nbody2hydro.py scripts/cloud_train.sh && ls -la bayronik_bundle.tar.gz
 
 # ---------------------------------------------------------------------------
 # Phase 2: scientific validation

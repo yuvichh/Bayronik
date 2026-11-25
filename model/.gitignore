@@ -39,6 +39,7 @@ uv.lock
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+!notebooks/*.ipynb
 
 # Data files (large, download separately)
 data/*.npy

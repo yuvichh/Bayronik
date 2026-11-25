@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """
-Training script for Bayronik baryonic field emulator.
+Training script for the Bayronik field-level baryon emulator.
+
+Task: map the total-matter map of a gravity-only (N-body) CAMELS box to the
+total-matter map of its hydrodynamic twin, conditioned on cosmology and
+feedback parameters. Units and normalisation live in bayronik_model/fields.py.
 
 Features:
-- FNO / U-FNO / traditional architectures
-- Multi-scale loss functions (pixel + spectral + stats)
-- Mixed precision training (AMP)
-- Cosine annealing with warmup
-- Gradient clipping
-- Wandb integration
-- Proper checkpointing and early stopping
-- Validation on multiple metrics
+- Periodic residual U-FNO (ufno_v2) plus the older architectures for ablations
+- Simulation-level train/val/test split, written next to the weights
+- Whole dataset on the GPU, augmentation by exact symmetries of a periodic map
+- Loss: log-field MSE + power spectrum of the density contrast + total mass
+- Mixed precision, warmup + cosine schedule per step, gradient clipping
+- Resumable checkpoints every epoch and an optional wall-clock budget
+- Per-epoch validation against the "no baryons" identity baseline
 
 Usage:
-    uv run train.py --model fno --dataset LH --epochs 100
-    uv run train.py --model ufno --dataset LH --epochs 100 --wandb
-    uv run train.py --model ufno_cond --conditional --wandb
+    uv run train.py --epochs 40
+    uv run train.py --time-budget-min 50 --epochs 200      # fit the schedule to a rental
+    uv run train.py --resume weights/ufno_v2_Mtot_Nbody_IllustrisTNG/last.pt
+    uv run train.py --max-train-sims 20 --max-val-sims 5 --epochs 1   # smoke test
 """
 
 import argparse
+import contextlib
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,23 +34,31 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from tqdm import tqdm
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from bayronik_model import UNet, ResUNet, AttentionUNet
 from bayronik_model.fno import FNO2d, FNO2dConditional, MultiscaleFNO2d
-from bayronik_model.ufno import UFNO2d, UFNO2dConditional, AttentionUFNO2d
-from bayronik_model.losses import BaryonicEmulatorLoss, PowerSpectrumLoss
-from bayronik_model.dataset import CAMELSDataset, create_dataloaders
+from bayronik_model.ufno import UFNO2d, UFNO2dConditional, AttentionUFNO2d, PeriodicUFNO2d
+from bayronik_model.losses import NbodyHydroLoss
+from bayronik_model.dataset import NbodyHydroMaps, sim_split
+from bayronik_model.fields import (
+    BOX_SIZE,
+    INPUT_FIELD_UNITS,
+    LOG10_SIGMA_MEAN,
+    LOG10_SIGMA_STD,
+    PARAM_NAMES,
+    relative_density,
+)
+from bayronik_model.spectra import PowerSpectrum2D, correlation_coefficient
 
 
 # Model registry
 MODELS = {
+    # Periodic residual U-FNO: the model for the N-body -> hydro task
+    "ufno_v2": PeriodicUFNO2d,
     # Traditional architectures
     "unet": UNet,
     "resunet": ResUNet,
@@ -61,6 +75,7 @@ MODELS = {
 
 # Default hyperparameters per model
 MODEL_DEFAULTS = {
+    "ufno_v2": {"base_channels": 32, "modes": 32, "depth": 4},
     "unet": {"base_features": 64},
     "resunet": {"base_features": 64},
     "attention_unet": {"base_features": 64},
@@ -71,6 +86,11 @@ MODEL_DEFAULTS = {
     "ufno_cond": {"base_channels": 32, "modes": 32, "depth": 4},
     "ufno_attention": {"base_channels": 32, "modes": 32, "depth": 4},
 }
+
+CONDITIONAL_MODELS = {"ufno_v2", "fno_cond", "ufno_cond"}
+
+# k values (h/Mpc) quoted in the per-epoch log line
+REPORT_K = (1.0, 5.0, 10.0, 20.0)
 
 
 def get_device() -> torch.device:
@@ -87,467 +107,456 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def create_model(
-    model_name: str,
-    conditional: bool = False,
-    num_conditions: int = 6,
-) -> nn.Module:
+def create_model(model_name: str, model_kwargs: Optional[dict] = None) -> nn.Module:
     """Create model from name."""
-    # Handle conditional variants
-    if conditional and "_cond" not in model_name:
-        model_name = model_name + "_cond"
-    
     if model_name not in MODELS:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(MODELS.keys())}")
-    
-    Model = MODELS[model_name]
+
     kwargs = MODEL_DEFAULTS.get(model_name, {}).copy()
-    
-    # Add conditional params
-    if "cond" in model_name:
-        kwargs["num_conditions"] = num_conditions
-    
-    return Model(in_channels=1, out_channels=1, **kwargs)
+    kwargs.update(model_kwargs or {})
+    if model_name in CONDITIONAL_MODELS:
+        kwargs["num_conditions"] = len(PARAM_NAMES)
+
+    return MODELS[model_name](in_channels=1, out_channels=1, **kwargs)
 
 
-def create_scheduler(
-    optimizer,
-    num_epochs: int,
-    warmup_epochs: int = 5,
-    min_lr: float = 1e-6,
-):
-    """Create learning rate scheduler with warmup."""
-    # Warmup scheduler
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=0.01,
-        end_factor=1.0,
-        total_iters=warmup_epochs,
+def predict(model: nn.Module, model_name: str, x: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+    """Run any registered model as input + correction, in network units.
+
+    ufno_v2 is residual by construction. The older architectures predict a
+    field, so they are wrapped the same way to keep ablations like for like.
+    """
+    if model_name == "ufno_v2":
+        return model(x, params)
+    if model_name in CONDITIONAL_MODELS:
+        return x + model(x, params)
+    return x + model(x)
+
+
+def lr_at(step: int, total_steps: int, base_lr: float, warmup_steps: int, min_lr: float) -> float:
+    """Linear warmup, then cosine decay to min_lr at total_steps."""
+    if step < warmup_steps:
+        return base_lr * (step + 1) / warmup_steps
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def autocast(device: torch.device, amp_dtype: Optional[torch.dtype]):
+    """Autocast context when mixed precision is on, a no-op otherwise."""
+    if amp_dtype is None:
+        return contextlib.nullcontext()
+    return torch.autocast(device.type, dtype=amp_dtype)
+
+
+def clip_grad_norm(parameters, max_norm: float) -> torch.Tensor:
+    """Global gradient-norm clipping that also handles complex parameters.
+
+    The spectral weights are complex, and torch's own clip_grad_norm_ cannot
+    take their norm on every backend (MPS), so the norm is taken over real and
+    imaginary parts.
+    """
+    grads = [p.grad for p in parameters if p.grad is not None]
+    total = torch.sqrt(
+        sum((torch.view_as_real(g) if g.is_complex() else g).float().pow(2).sum() for g in grads)
     )
-    
-    # Cosine annealing
-    main_scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=num_epochs - warmup_epochs,
-        eta_min=min_lr,
-    )
-    
-    # Combine
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, main_scheduler],
-        milestones=[warmup_epochs],
-    )
-    
-    return scheduler
+    scale = (max_norm / (total + 1e-6)).clamp(max=1.0)
+    for g in grads:
+        g.mul_(scale)
+    return total
 
 
 def train_epoch(
     model: nn.Module,
-    loader,
-    criterion: BaryonicEmulatorLoss,
+    model_name: str,
+    data: NbodyHydroMaps,
+    criterion: NbodyHydroLoss,
     optimizer,
-    scaler: Optional[GradScaler],
+    scaler,
     device: torch.device,
-    conditional: bool = False,
-    grad_clip: float = 1.0,
+    args,
+    state: dict,
+    generator: torch.Generator,
+    amp_dtype: Optional[torch.dtype],
 ) -> Dict[str, float]:
-    """Train for one epoch."""
+    """Train for one epoch. `state` carries the global step and schedule length."""
     model.train()
-    
-    total_loss = 0.0
-    loss_components = {}
+
+    sums: Dict[str, float] = {}
     num_batches = 0
-    
-    pbar = tqdm(loader, desc="Train", leave=False)
-    for batch in pbar:
-        # Unpack batch
-        if conditional and len(batch) == 3:
-            inp, tgt, params = batch
-            inp, tgt, params = inp.to(device), tgt.to(device), params.to(device)
-        else:
-            inp, tgt = batch[:2]
-            inp, tgt = inp.to(device), tgt.to(device)
-            params = None
-        
-        optimizer.zero_grad()
-        
-        # Forward pass with AMP
-        with autocast(enabled=scaler is not None):
-            if params is not None:
-                pred = model(inp, params)
-            else:
-                pred = model(inp)
-            
-            losses = criterion(pred, tgt, inp)
-            loss = losses['total']
-        
-        # Backward pass
+    log_every = max(1, data.num_batches(args.batch_size, drop_last=True) // 10)
+
+    for x, y, params in data.batches(
+        args.batch_size, shuffle=True, augment=args.augment, generator=generator, drop_last=True
+    ):
+        x, y, params = x.to(device), y.to(device), params.to(device)
+        if args.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+
+        lr = lr_at(state["step"], state["total_steps"], args.lr, args.warmup_steps, args.min_lr)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # bf16 needs no GradScaler; fp16 does. The loss always runs in float32.
+        with autocast(device, amp_dtype):
+            pred = predict(model, model_name, x, params)
+        losses = criterion(pred, y)
+        loss = losses['total']
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite loss at step {state['step']}: {losses}")
+
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            clip_grad_norm(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            clip_grad_norm(model.parameters(), args.grad_clip)
             optimizer.step()
-        
-        # Track losses
-        total_loss += loss.item()
+
         for key, value in losses.items():
-            if key not in ('total', 'weights'):
-                if key not in loss_components:
-                    loss_components[key] = 0.0
-                loss_components[key] += value.item()
-        
+            sums[key] = sums.get(key, 0.0) + value.item()
         num_batches += 1
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
-    
-    # Average losses
-    avg_losses = {'total': total_loss / num_batches}
-    for key, value in loss_components.items():
-        avg_losses[key] = value / num_batches
-    
-    return avg_losses
+        state["step"] += 1
+
+        if args.verbose and num_batches % log_every == 0:
+            print(f"    step {state['step']:6d}  loss {loss.item():.5f}  lr {lr:.2e}", flush=True)
+
+    return {key: value / num_batches for key, value in sums.items()}
 
 
 @torch.no_grad()
 def validate(
     model: nn.Module,
-    loader,
-    criterion: BaryonicEmulatorLoss,
+    model_name: str,
+    data: NbodyHydroMaps,
+    criterion: NbodyHydroLoss,
+    power: PowerSpectrum2D,
     device: torch.device,
-    conditional: bool = False,
+    args,
+    amp_dtype: Optional[torch.dtype],
 ) -> Dict[str, float]:
-    """Validate model."""
+    """Validation losses plus the numbers the result is judged on.
+
+    Reports the log-field MSE in dex^2 for the model and for the identity
+    ("no baryons") baseline, and at a few k the power ratio P_pred / P_true
+    and the cross-correlation with the truth for both.
+    """
     model.eval()
-    
-    total_loss = 0.0
-    loss_components = {}
-    num_batches = 0
-    
-    for batch in tqdm(loader, desc="Val", leave=False):
-        if conditional and len(batch) == 3:
-            inp, tgt, params = batch
-            inp, tgt, params = inp.to(device), tgt.to(device), params.to(device)
-        else:
-            inp, tgt = batch[:2]
-            inp, tgt = inp.to(device), tgt.to(device)
-            params = None
-        
-        if params is not None:
-            pred = model(inp, params)
-        else:
-            pred = model(inp)
-        
-        losses = criterion(pred, tgt, inp)
-        
-        total_loss += losses['total'].item()
+
+    sums: Dict[str, float] = {}
+    spec = {name: torch.zeros(power.n_bins, device=device) for name in ("ratio", "r", "ratio_id", "r_id")}
+    n_maps = 0
+
+    for x, y, params in data.batches(args.batch_size):
+        x, y, params = x.to(device), y.to(device), params.to(device)
+        with autocast(device, amp_dtype):
+            pred = predict(model, model_name, x, params)
+        pred = pred.float()
+        b = x.shape[0]
+
+        losses = criterion(pred, y)
         for key, value in losses.items():
-            if key not in ('total', 'weights'):
-                if key not in loss_components:
-                    loss_components[key] = 0.0
-                loss_components[key] += value.item()
-        
-        num_batches += 1
-    
-    avg_losses = {'total': total_loss / num_batches}
-    for key, value in loss_components.items():
-        avg_losses[key] = value / num_batches
-    
-    return avg_losses
+            sums[key] = sums.get(key, 0.0) + value.item() * b
+        sums["mse_dex2"] = sums.get("mse_dex2", 0.0) + ((pred - y) ** 2).mean().item() * LOG10_SIGMA_STD ** 2 * b
+        sums["mse_dex2_identity"] = (
+            sums.get("mse_dex2_identity", 0.0) + ((x - y) ** 2).mean().item() * LOG10_SIGMA_STD ** 2 * b
+        )
+
+        rho_true = relative_density(y)
+        mean_true = rho_true.mean(dim=(1, 2, 3), keepdim=True)
+        d_true = rho_true / mean_true - 1
+        for name, field in (("", pred), ("_id", x)):
+            d = relative_density(field) / mean_true - 1
+            p_aa, p_bb, p_ab = power.cross(d, d_true)
+            spec["ratio" + name] += (p_aa / p_bb).sum(0)
+            spec["r" + name] += correlation_coefficient(p_aa, p_bb, p_ab).sum(0)
+        n_maps += b
+
+    out = {key: value / n_maps for key, value in sums.items()}
+    for k_report in REPORT_K:
+        i = int(torch.argmin((power.k - k_report).abs()))
+        for name, values in spec.items():
+            out[f"{name}_k{k_report:g}"] = (values[i] / n_maps).item()
+    return out
 
 
-def save_checkpoint(
-    model: nn.Module,
-    optimizer,
-    scheduler,
-    epoch: int,
-    best_loss: float,
-    path: Path,
-    config: dict,
-):
-    """Save training checkpoint."""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'best_loss': best_loss,
-        'config': config,
-    }
-    torch.save(checkpoint, path)
+def save_atomic(obj, path: Path):
+    """Write then rename, so an interrupted save never leaves a broken file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
 def train(args):
     """Main training function."""
     device = get_device()
     print(f"Device: {device}")
-    
-    # Paths
-    weights_dir = Path(args.weights_dir)
-    weights_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize wandb
-    if args.wandb:
-        import wandb
-        wandb.init(
-            project="bayronik",
-            name=f"{args.model}_{args.dataset}",
-            config=vars(args),
-        )
-    
-    # Data
-    conditional = args.conditional or "cond" in args.model
-    train_loader, val_loader = create_dataloaders(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        suite=args.suite,
-        dataset_type=args.dataset,
-        augment_train=args.augment,
-        return_params=conditional,
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
+    torch.manual_seed(args.seed)
+    generator = torch.Generator().manual_seed(args.seed)
+
+    run_name = args.run_name or f"{args.model}_{args.input_field}_{args.suite}"
+    run_dir = Path(args.weights_dir) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Data. The split is at simulation granularity: the 15 maps of one box share
+    # its large-scale structure, so they must stay on one side. The held-out
+    # test sims are never loaded here.
+    n_sims = 1000 if args.dataset == "LH" else 27
+    split = sim_split(n_sims, args.val_split, args.test_split, args.split_seed)
+    train_sims, val_sims = split["train"], split["val"]
+    if args.max_train_sims:
+        train_sims = train_sims[: args.max_train_sims]
+    if args.max_val_sims:
+        val_sims = val_sims[: args.max_val_sims]
+
+    split_payload = {
+        "seed": args.split_seed,
+        "suite": args.suite,
+        "dataset_type": args.dataset,
+        "n_sims": n_sims,
+        "maps_per_sim": NbodyHydroMaps.MAPS_PER_SIM,
+        "train_sims": [int(s) for s in split["train"]],
+        "val_sims": [int(s) for s in split["val"]],
+        "test_sims": [int(s) for s in split["test"]],
+    }
+    (run_dir / "split.json").write_text(json.dumps(split_payload, indent=2))
+
+    data_device = args.data_device
+    if data_device == "auto":
+        big_gpu = device.type == "cuda" and torch.cuda.get_device_properties(0).total_memory > 20e9
+        data_device = "cuda" if big_gpu else "cpu"
+
+    t0 = time.time()
+    common = dict(
+        data_dir=args.data_dir, suite=args.suite, dataset_type=args.dataset,
+        input_field=args.input_field, device=data_device,
     )
-    
-    print(f"Dataset: {args.dataset} ({len(train_loader.dataset)} train, {len(val_loader.dataset)} val)")
-    
+    train_data = NbodyHydroMaps(sims=train_sims, **common)
+    val_data = NbodyHydroMaps(sims=val_sims, **common)
+    print(
+        f"Data: {args.input_field} -> Mtot ({args.suite} {args.dataset}), "
+        f"{len(train_sims)} train / {len(val_sims)} val / {len(split['test'])} test sims, "
+        f"{len(train_data)} train maps on {data_device}, loaded in {time.time() - t0:.0f}s"
+    )
+
     # Model
-    model = create_model(args.model, conditional=conditional).to(device)
+    model = create_model(args.model).to(device)
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
     num_params = count_parameters(model)
     print(f"Model: {args.model} ({num_params:,} params)")
-    
-    # Resume from checkpoint
+
+    criterion = NbodyHydroLoss(
+        spectral_weight=args.spectral_weight,
+        mass_weight=args.mass_weight,
+        resolution=train_data.x.shape[-1],
+        box_size=BOX_SIZE,
+    ).to(device)
+    power = PowerSpectrum2D(train_data.x.shape[-1], BOX_SIZE).to(device)
+
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+
+    # Mixed precision. bf16 is preferred on recent GPUs: no loss scaling, and
+    # the spectral layers cast to float32 internally.
+    amp_dtype: Optional[torch.dtype] = None
+    scaler = None
+    if device.type == "cuda":
+        if args.amp == "bf16":
+            amp_dtype = torch.bfloat16
+        elif args.amp == "fp16":
+            amp_dtype = torch.float16
+            scaler = torch.amp.GradScaler("cuda")
+    print(f"AMP: {amp_dtype if amp_dtype is not None else 'disabled'}")
+
+    steps_per_epoch = train_data.num_batches(args.batch_size, drop_last=True)
+    state = {"step": 0, "total_steps": args.epochs * steps_per_epoch}
     start_epoch = 0
     best_val_loss = float("inf")
-    
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint['best_loss']
-        print(f"Resumed from epoch {start_epoch}")
-    
-    # Loss function
-    criterion = BaryonicEmulatorLoss(
-        pixel_weight=args.pixel_weight,
-        spectral_weight=args.spectral_weight,
-        stats_weight=args.stats_weight,
-        gradient_weight=args.gradient_weight,
-        multiscale_weight=args.multiscale_weight,
-        mass_weight=args.mass_weight,
-        resolution=256,
-    ).to(device)
-    
-    # Optimizer
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.999),
-    )
-    
-    if args.resume:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    # Scheduler
-    scheduler = create_scheduler(
-        optimizer,
-        num_epochs=args.epochs,
-        warmup_epochs=args.warmup_epochs,
-        min_lr=args.min_lr,
-    )
-    
-    if args.resume:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    # Mixed precision
-    use_amp = device.type == "cuda" and args.amp
-    scaler = GradScaler() if use_amp else None
-    print(f"AMP: {'enabled' if use_amp else 'disabled'}")
-    
-    # Training config for saving
+    planned_epochs = args.epochs
+
     config = {
         'model': args.model,
+        'model_kwargs': MODEL_DEFAULTS.get(args.model, {}),
+        'input_field': args.input_field,
+        'input_unit_factor': INPUT_FIELD_UNITS[args.input_field],
+        'log10_sigma_mean': LOG10_SIGMA_MEAN,
+        'log10_sigma_std': LOG10_SIGMA_STD,
+        'param_names': list(PARAM_NAMES),
         'dataset': args.dataset,
         'suite': args.suite,
-        'conditional': conditional,
-        'epochs': args.epochs,
+        'split_seed': args.split_seed,
+        'val_split': args.val_split,
+        'test_split': args.test_split,
         'batch_size': args.batch_size,
         'lr': args.lr,
+        'spectral_weight': args.spectral_weight,
+        'mass_weight': args.mass_weight,
         'num_params': num_params,
+        'seed': args.seed,
     }
-    
-    # Paths for saving
-    model_name = f"{args.model}_{args.dataset}_{args.suite}"
-    best_path = weights_dir / f"best_{model_name}.pth"
-    checkpoint_path = weights_dir / f"checkpoint_{model_name}.pth"
-    
-    # Training loop
-    patience_counter = 0
-    
+
+    best_path = run_dir / "best.pt"
+    last_path = run_dir / "last.pt"
+    log_path = run_dir / "log.jsonl"
+
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if scaler is not None and checkpoint.get('scaler_state_dict'):
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        state = checkpoint['state']
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint['best_loss']
+        planned_epochs = checkpoint.get('planned_epochs', args.epochs)
+        if args.extend_schedule:
+            planned_epochs = args.epochs
+            state["total_steps"] = args.epochs * steps_per_epoch
+        print(f"Resumed from epoch {start_epoch} (step {state['step']}, {planned_epochs} epochs planned)")
+
     print(f"\n{'='*60}")
-    print(f"Starting training for {args.epochs} epochs")
+    print(f"Training {run_name}: up to {planned_epochs} epochs, {steps_per_epoch} steps each")
+    if args.time_budget_min:
+        print(f"Wall-clock budget: {args.time_budget_min:.0f} min")
     print(f"{'='*60}\n")
-    
-    for epoch in range(start_epoch, args.epochs):
+
+    run_start = time.time()
+    epoch_seconds = None
+
+    for epoch in range(start_epoch, planned_epochs):
+        if args.time_budget_min and epoch_seconds is not None:
+            remaining = args.time_budget_min * 60 - (time.time() - run_start)
+            if remaining < epoch_seconds:
+                print(f"Stopping before epoch {epoch+1}: {remaining/60:.1f} min left, an epoch takes {epoch_seconds/60:.1f}")
+                break
+
         epoch_start = time.time()
-        
-        # Train
+
         train_losses = train_epoch(
-            model, train_loader, criterion, optimizer, scaler,
-            device, conditional, args.grad_clip
+            model, args.model, train_data, criterion, optimizer, scaler,
+            device, args, state, generator, amp_dtype,
         )
-        
-        # Validate
-        val_losses = validate(model, val_loader, criterion, device, conditional)
-        
-        # Step scheduler
-        scheduler.step()
-        
-        # Time
-        epoch_time = time.time() - epoch_start
-        
-        # Check improvement
-        improved = val_losses['total'] < best_val_loss
+        val = validate(model, args.model, val_data, criterion, power, device, args, amp_dtype)
+
+        epoch_seconds = time.time() - epoch_start
+
+        # With a time budget, fit the schedule to what the hardware can do:
+        # after the first epoch the epoch time is known, so set the number of
+        # epochs so the cosine decay ends when the budget does.
+        if args.time_budget_min and epoch == start_epoch:
+            budget = args.time_budget_min * 60 - (time.time() - run_start)
+            fit = epoch + 1 + max(0, int(budget // epoch_seconds))
+            if fit < planned_epochs:
+                planned_epochs = fit
+                state["total_steps"] = planned_epochs * steps_per_epoch
+                print(f"  epoch takes {epoch_seconds:.0f}s: schedule set to {planned_epochs} epochs")
+
+        improved = val['total'] < best_val_loss
         if improved:
-            best_val_loss = val_losses['total']
-            patience_counter = 0
-            
-            # Save best model
-            model.cpu()
-            torch.save(model.state_dict(), best_path)
-            model.to(device)
-        else:
-            patience_counter += 1
-        
-        # Save checkpoint
-        save_checkpoint(
-            model, optimizer, scheduler, epoch, best_val_loss,
-            checkpoint_path, config
+            best_val_loss = val['total']
+            save_atomic({'model_state_dict': model.state_dict(), 'config': config, 'epoch': epoch, 'val': val}, best_path)
+
+        save_atomic(
+            {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+                'state': state,
+                'best_loss': best_val_loss,
+                'planned_epochs': planned_epochs,
+                'config': config,
+            },
+            last_path,
         )
-        
-        # Current LR
+
         lr = optimizer.param_groups[0]['lr']
-        
-        # Print progress
         marker = "*" if improved else ""
         print(
-            f"Epoch {epoch+1:3d}/{args.epochs} │ "
+            f"Epoch {epoch+1:3d}/{planned_epochs} │ "
             f"train {train_losses['total']:.5f} │ "
-            f"val {val_losses['total']:.5f} │ "
-            f"lr {lr:.2e} │ "
-            f"{epoch_time:.1f}s {marker}"
+            f"val {val['total']:.5f} │ "
+            f"mse {val['mse_dex2']*1e3:.3f} (identity {val['mse_dex2_identity']*1e3:.3f}) e-3 dex² │ "
+            f"P/Ptrue k=10: {val['ratio_k10']:.3f} (id {val['ratio_id_k10']:.3f}) │ "
+            f"r k=10: {val['r_k10']:.4f} (id {val['r_id_k10']:.4f}) │ "
+            f"lr {lr:.2e} │ {epoch_seconds:.0f}s {marker}",
+            flush=True,
         )
-        
-        # Detailed losses
-        if args.verbose:
-            print(f"  └─ pixel: {val_losses.get('pixel', 0):.5f}, "
-                  f"spectral: {val_losses.get('spectral', 0):.5f}, "
-                  f"stats: {val_losses.get('stats', 0):.5f}")
-        
-        # Wandb logging
-        if args.wandb:
-            log_dict = {
-                'epoch': epoch,
-                'train/total': train_losses['total'],
-                'val/total': val_losses['total'],
-                'lr': lr,
-            }
-            for key in ['pixel', 'spectral', 'stats', 'gradient', 'multiscale']:
-                if key in train_losses:
-                    log_dict[f'train/{key}'] = train_losses[key]
-                if key in val_losses:
-                    log_dict[f'val/{key}'] = val_losses[key]
-            wandb.log(log_dict)
-        
-        # Early stopping
-        if patience_counter >= args.patience:
-            print(f"\nEarly stopping at epoch {epoch+1} (no improvement for {args.patience} epochs)")
-            break
-    
-    # Final summary
+
+        with log_path.open("a") as f:
+            record = {"epoch": epoch + 1, "step": state["step"], "lr": lr, "seconds": epoch_seconds}
+            record.update({f"train/{k}": v for k, v in train_losses.items()})
+            record.update({f"val/{k}": v for k, v in val.items()})
+            f.write(json.dumps(record) + "\n")
+
     print(f"\n{'='*60}")
-    print(f"Training complete!")
-    print(f"Best validation loss: {best_val_loss:.6f}")
-    print(f"Model saved to: {best_path}")
+    print(f"Training complete. Best validation loss: {best_val_loss:.6f}")
+    print(f"Weights: {best_path}")
+    print(f"Evaluate on the held-out test sims with benchmarks/nbody2hydro.py --weights {best_path}")
     print(f"{'='*60}")
-    
-    # Export to TorchScript
-    print("\nExporting to TorchScript...")
-    model.cpu()
-    model.load_state_dict(torch.load(best_path))
-    model.eval()
-    
-    # Trace
-    dummy_input = torch.randn(1, 1, 256, 256)
-    if conditional:
-        dummy_params = torch.randn(1, 6)
-        traced = torch.jit.trace(model, (dummy_input, dummy_params))
-    else:
-        traced = torch.jit.trace(model, dummy_input)
-    
-    ts_path = weights_dir / f"traced_{model_name}.pt"
-    traced.save(str(ts_path))
-    print(f"TorchScript saved to: {ts_path}")
-    
-    if args.wandb:
-        wandb.finish()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train Bayronik baryonic field emulator",
+        description="Train the Bayronik baryon emulator (N-body -> hydro total matter)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    
+
     # Data
     parser.add_argument("--data-dir", type=str, default="data", help="Data directory")
-    parser.add_argument("--dataset", type=str, default="CV", choices=["CV", "LH"], help="Dataset type")
-    parser.add_argument("--suite", type=str, default="IllustrisTNG", help="Simulation suite")
-    
+    parser.add_argument("--dataset", type=str, default="LH", choices=["CV", "LH"], help="Dataset type")
+    parser.add_argument("--suite", type=str, default="IllustrisTNG", help="Hydro suite of the target maps")
+    parser.add_argument("--input-field", type=str, default="Mtot_Nbody", choices=list(INPUT_FIELD_UNITS),
+                        help="Mtot_Nbody: gravity-only run. Mcdm: dark matter of the hydro run (old task, for comparison)")
+    parser.add_argument("--val-split", type=float, default=0.10, help="Fraction of sims for validation")
+    parser.add_argument("--test-split", type=float, default=0.10, help="Fraction of sims held out for final test")
+    parser.add_argument("--split-seed", type=int, default=42, help="Seed of the simulation split")
+    parser.add_argument("--max-train-sims", type=int, default=0, help="Use only this many training sims (0 = all)")
+    parser.add_argument("--max-val-sims", type=int, default=0, help="Use only this many validation sims (0 = all)")
+    parser.add_argument("--data-device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
+                        help="Where the dataset tensors live; auto puts them on a GPU with > 20 GB")
+    parser.add_argument("--no-augment", dest="augment", action="store_false", help="Disable flips, transposes and shifts")
+
     # Model
-    parser.add_argument("--model", type=str, default="ufno", choices=list(MODELS.keys()), help="Model architecture")
-    parser.add_argument("--conditional", action="store_true", help="Use conditional model with physics params")
-    
+    parser.add_argument("--model", type=str, default="ufno_v2", choices=list(MODELS.keys()), help="Model architecture")
+
     # Training
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate")
+    parser.add_argument("--epochs", type=int, default=40, help="Number of epochs (upper bound with --time-budget-min)")
+    parser.add_argument("--time-budget-min", type=float, default=0, help="Wall-clock budget in minutes; the schedule is fitted to it (0 = off)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate")
+    parser.add_argument("--min-lr", type=float, default=1e-6, help="Final learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay")
-    parser.add_argument("--warmup-epochs", type=int, default=5, help="Warmup epochs")
+    parser.add_argument("--warmup-steps", type=int, default=500, help="Linear warmup steps")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping")
-    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
-    
+    parser.add_argument("--seed", type=int, default=0, help="Seed for initialisation, shuffling and augmentation")
+
     # Loss weights
-    parser.add_argument("--pixel-weight", type=float, default=1.0, help="Pixel loss weight")
-    parser.add_argument("--spectral-weight", type=float, default=0.5, help="Spectral loss weight")
-    parser.add_argument("--stats-weight", type=float, default=0.1, help="Statistics loss weight")
-    parser.add_argument("--gradient-weight", type=float, default=0.05, help="Gradient loss weight")
-    parser.add_argument("--multiscale-weight", type=float, default=0.1, help="Multiscale loss weight")
-    parser.add_argument("--mass-weight", type=float, default=0.01, help="Mass conservation loss weight")
-    
+    parser.add_argument("--spectral-weight", type=float, default=0.1, help="Power spectrum loss weight")
+    parser.add_argument("--mass-weight", type=float, default=0.1, help="Mass conservation loss weight")
+
     # System
-    parser.add_argument("--workers", type=int, default=4, help="Data loading workers")
     parser.add_argument("--weights-dir", type=str, default="weights", help="Weights directory")
-    parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
-    parser.add_argument("--amp", action="store_true", default=False, help="Use automatic mixed precision")
-    parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable AMP")
-    parser.add_argument("--augment", action="store_true", default=True, help="Use data augmentation")
-    
+    parser.add_argument("--run-name", type=str, default=None, help="Run directory name (default: model_input_suite)")
+    parser.add_argument("--resume", type=str, default=None, help="Resume from a last.pt checkpoint")
+    parser.add_argument("--extend-schedule", action="store_true", help="On resume, restart the schedule length from --epochs")
+    parser.add_argument("--amp", type=str, default="bf16", choices=["off", "bf16", "fp16"], help="Mixed precision on CUDA")
+    parser.add_argument("--no-channels-last", dest="channels_last", action="store_false", help="Keep NCHW memory layout")
+
     # Logging
-    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
-    parser.add_argument("--verbose", action="store_true", help="Verbose output")
-    
+    parser.add_argument("--verbose", action="store_true", help="Print the loss ten times per epoch")
+
     args = parser.parse_args()
-    
-    # Platform-specific adjustments
-    if sys.platform == "darwin":
-        args.workers = 0  # macOS fork issues
-        args.amp = False  # MPS doesn't fully support AMP
-    
     train(args)
 
 

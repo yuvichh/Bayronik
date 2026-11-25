@@ -416,6 +416,178 @@ class UFNO2dConditional(nn.Module):
         return self.project(h)
 
 
+class PeriodicUFNOBlock(nn.Module):
+    """
+    Spectral + local convolution block for periodic maps, with FiLM conditioning.
+
+    Architecture:
+        x -> SpectralConv + Conv -> GroupNorm -> GELU -> Conv -> GroupNorm
+          -> FiLM(conditions) -> GELU -> + skip(x)
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, modes: int, cond_dim: int):
+        super().__init__()
+        self.spectral_conv = SpectralConv2d(in_channels, out_channels, modes, modes)
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1, padding_mode="circular", bias=False)
+        self.norm1 = nn.GroupNorm(8, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, padding_mode="circular", bias=False)
+        self.norm2 = nn.GroupNorm(8, out_channels)
+
+        # gamma and beta; zero-initialised by the parent so the block starts unconditioned
+        self.film = nn.Linear(cond_dim, out_channels * 2)
+
+        self.skip = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.spectral_conv(x) + self.conv1(x)
+        h = self.act(self.norm1(h))
+        h = self.norm2(self.conv2(h))
+
+        gamma, beta = self.film(cond).chunk(2, dim=1)
+        h = (1 + gamma[:, :, None, None]) * h + beta[:, :, None, None]
+
+        return self.act(h) + self.skip(x)
+
+
+class PeriodicUFNO2d(nn.Module):
+    """
+    Conditional U-FNO for periodic maps that predicts a correction to its input.
+
+    Differences from UFNO2dConditional, each tied to the N-body -> hydro task:
+
+    - Every convolution pads periodically. A CAMELS map is a full projection of
+      a periodic box, so its left edge continues at its right edge; zero
+      padding invents a wall there. Upsampling is nearest-neighbour followed by
+      a periodic convolution for the same reason. The network is then exactly
+      equivariant to shifts by a multiple of its total stride.
+    - The output is input + correction, and the last layer starts at zero. An
+      untrained network is the "no baryons" baseline, and training only has to
+      learn the baryonic correction (0.09 dex rms on a 0.48 dex field).
+    - FiLM conditioning acts inside every block, encoder and decoder, so the
+      parameters reach the largest scales too.
+
+    Input and output are in network units, see ``fields.py``.
+
+    Args:
+        base_channels: Base channel count (doubles each scale)
+        modes: Base Fourier modes (halves each scale)
+        depth: Number of resolution levels
+        num_conditions: Number of conditioning parameters
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        base_channels: int = 32,
+        modes: int = 32,
+        depth: int = 4,
+        num_conditions: int = 6,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if in_channels != out_channels:
+            raise ValueError("a residual model needs in_channels == out_channels")
+        self.depth = depth
+        self.base_channels = base_channels
+        cond_dim = base_channels * 4
+
+        self.condition_embed = nn.Sequential(
+            nn.Linear(num_conditions, cond_dim),
+            nn.GELU(),
+            nn.Linear(cond_dim, cond_dim),
+            nn.GELU(),
+        )
+
+        self.lift = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, padding=1, padding_mode="circular"),
+            nn.GELU(),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1, padding_mode="circular"),
+        )
+
+        # Encoder: channels double and modes halve at each level, as in UFNO2d
+        self.encoders = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        ch = base_channels
+        m = modes
+        level_channels = []
+        level_modes = []
+        for i in range(depth):
+            out_ch = ch * 2 if i < depth - 1 else ch
+            self.encoders.append(PeriodicUFNOBlock(ch, out_ch, m, cond_dim))
+            level_channels.append(out_ch)
+            level_modes.append(m)
+            ch = out_ch
+            if i < depth - 1:
+                self.downs.append(
+                    nn.Conv2d(ch, ch, 4, stride=2, padding=1, padding_mode="circular")
+                )
+                m = max(m // 2, 4)
+
+        self.bottleneck = PeriodicUFNOBlock(ch, ch, m, cond_dim)
+
+        # Decoder: one block per skip connection, coarse to fine
+        self.ups = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        for i in range(depth - 2, -1, -1):
+            skip_ch = level_channels[i]
+            out_ch = skip_ch // 2
+            self.ups.append(
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="nearest"),
+                    nn.Conv2d(ch, ch, 3, padding=1, padding_mode="circular"),
+                )
+            )
+            # as in UFNO2d, a decoder block uses the modes of the level below it
+            self.decoders.append(PeriodicUFNOBlock(ch + skip_ch, out_ch, level_modes[i + 1], cond_dim))
+            ch = out_ch
+
+        self.project = nn.Sequential(
+            nn.Conv2d(ch, base_channels, 3, padding=1, padding_mode="circular"),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv2d(base_channels, out_channels, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, PeriodicUFNOBlock):
+                nn.init.zeros_(m.film.weight)
+                nn.init.zeros_(m.film.bias)
+
+        # Start as the identity map: the correction is zero until trained
+        nn.init.zeros_(self.project[-1].weight)
+        nn.init.zeros_(self.project[-1].bias)
+
+    def forward(self, x: torch.Tensor, conditions: torch.Tensor) -> torch.Tensor:
+        cond = self.condition_embed(conditions)
+
+        h = self.lift(x)
+
+        skips = []
+        for i, encoder in enumerate(self.encoders):
+            h = encoder(h, cond)
+            if i < self.depth - 1:
+                skips.append(h)
+                h = self.downs[i](h)
+
+        h = self.bottleneck(h, cond)
+
+        for up, decoder in zip(self.ups, self.decoders):
+            h = torch.cat([up(h), skips.pop()], dim=1)
+            h = decoder(h, cond)
+
+        return x + self.project(h)
+
+
 class AttentionUFNO2d(nn.Module):
     """
     U-FNO with self-attention for enhanced global reasoning.

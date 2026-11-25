@@ -442,6 +442,69 @@ class BaryonicEmulatorLoss(nn.Module):
         return losses
 
 
+class NbodyHydroLoss(nn.Module):
+    """
+    Loss for the N-body -> hydro task, on fields in network units (``fields.py``).
+
+    Three terms, each tied to something the result is judged on:
+
+    - pixel: MSE of the log-density field. Rewards getting every pixel right,
+      voids as much as halos, and keeps the phases.
+    - spectral: mean squared log-ratio of the power spectra of the density
+      contrast, in physical k. An MSE-only model predicts the conditional mean,
+      which loses power wherever the answer is uncertain (small scales); this
+      term restores the amplitude that P(k) and the suppression S(k) need.
+    - mass: relative error of the total mass per map, in linear space. Baryons
+      move mass around but do not create it: hydro / N-body is 1.000 +- 0.006.
+
+    Args:
+        spectral_weight: Weight of the power-spectrum term
+        mass_weight: Weight of the mass term
+        resolution: Map size in pixels
+        box_size: Map side in Mpc/h
+    """
+
+    def __init__(
+        self,
+        spectral_weight: float = 0.1,
+        mass_weight: float = 0.1,
+        resolution: int = 256,
+        box_size: float = 25.0,
+    ):
+        super().__init__()
+        from .spectra import PowerSpectrum2D
+
+        self.spectral_weight = spectral_weight
+        self.mass_weight = mass_weight
+        self.power = PowerSpectrum2D(resolution, box_size)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, torch.Tensor]:
+        from .fields import relative_density
+
+        pred, target = pred.float(), target.float()
+        losses = {'pixel': F.mse_loss(pred, target)}
+
+        rho_pred = relative_density(pred)
+        rho_target = relative_density(target)
+        mean_target = rho_target.mean(dim=(1, 2, 3), keepdim=True)
+
+        mass_ratio = rho_pred.mean(dim=(1, 2, 3)) / mean_target.flatten()
+        losses['mass'] = (mass_ratio - 1).abs().mean()
+
+        # Both contrasts use the target mean, so an amplitude error is not normalised away
+        p_pred = self.power.auto(rho_pred / mean_target - 1)
+        p_target = self.power.auto(rho_target / mean_target - 1)
+        log_ratio = torch.log(p_pred.clamp_min(1e-20) / p_target.clamp_min(1e-20))
+        losses['spectral'] = (log_ratio ** 2).mean()
+
+        losses['total'] = (
+            losses['pixel']
+            + self.spectral_weight * losses['spectral']
+            + self.mass_weight * losses['mass']
+        )
+        return losses
+
+
 def create_loss(config: dict) -> BaryonicEmulatorLoss:
     """
     Factory function to create loss from config dict.
