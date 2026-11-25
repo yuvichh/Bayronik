@@ -241,6 +241,37 @@ def test_loss_spectral_term_sees_lost_small_scale_power():
     assert out["total"].requires_grad is False
 
 
+def test_model_pre_projection_activations_are_bounded():
+    model = PeriodicUFNO2d(base_channels=16, modes=8, depth=4, num_conditions=6)
+    x = torch.randn(2, 1, 64, 64, generator=torch.Generator().manual_seed(0)) * 2.0
+    p = torch.zeros(2, 6)
+    captured = {}
+    handle = model.project[-1].register_forward_pre_hook(
+        lambda _m, inp: captured.update(std=inp[0].std().item(), mx=inp[0].abs().max().item())
+    )
+    try:
+        with torch.no_grad():
+            model(x, p)
+    finally:
+        handle.remove()
+    assert captured["std"] < 5.0
+    assert captured["mx"] < 50.0
+
+
+def test_loss_stays_finite_on_extreme_outlier():
+    loss = NbodyHydroLoss(resolution=64)
+    y = torch.randn(2, 1, 64, 64, generator=torch.Generator().manual_seed(0))
+    pred = y.clone().requires_grad_(True)
+    with torch.no_grad():
+        pred[0, 0, 0, 0] = 100.0  # would overflow float32 exp() without clamping
+    out = loss(pred, y)
+    for key, val in out.items():
+        assert torch.isfinite(val), f"{key} was non-finite: {val}"
+    out["total"].backward()
+    assert torch.isfinite(pred.grad).all()
+    assert pred.grad[0, 0, 0, 0].item() > 0.0  # pixel MSE pulls outlier back down
+
+
 # --- training utilities ----------------------------------------------------
 
 

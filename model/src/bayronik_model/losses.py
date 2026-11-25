@@ -484,7 +484,10 @@ class NbodyHydroLoss(nn.Module):
         pred, target = pred.float(), target.float()
         losses = {'pixel': F.mse_loss(pred, target)}
 
-        rho_pred = relative_density(pred)
+        # Clamp only for linear-space exponentiation (physical CAMELS maps lie
+        # in [-3, 10]) so transient early-training spikes cannot overflow exp()
+        # or |FFT|^2 in float32; pixel MSE stays unclamped to pull outliers back.
+        rho_pred = relative_density(pred.clamp(-12.0, 14.0))
         rho_target = relative_density(target)
         mean_target = rho_target.mean(dim=(1, 2, 3), keepdim=True)
 

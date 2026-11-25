@@ -545,7 +545,8 @@ class PeriodicUFNO2d(nn.Module):
             ch = out_ch
 
         self.project = nn.Sequential(
-            nn.Conv2d(ch, base_channels, 3, padding=1, padding_mode="circular"),
+            nn.Conv2d(ch, base_channels, 3, padding=1, padding_mode="circular", bias=False),
+            nn.GroupNorm(8, base_channels),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Conv2d(base_channels, out_channels, 1),
@@ -556,7 +557,7 @@ class PeriodicUFNO2d(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, PeriodicUFNOBlock):
